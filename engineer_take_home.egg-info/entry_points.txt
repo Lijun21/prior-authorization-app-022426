@@ -1,0 +1,2 @@
+[console_scripts]
+generate-patient-data = scripts.generate_patient_data:main

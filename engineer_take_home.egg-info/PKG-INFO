@@ -1,0 +1,267 @@
+Metadata-Version: 2.4
+Name: engineer-take-home
+Version: 0.1.0
+Author-email: Mel van Londen <mel@develophealth.io>
+Requires-Python: <3.14,>=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: fastapi>=0.115.12
+Requires-Dist: uvicorn>=0.34.3
+Requires-Dist: python-dotenv>=1.0.0
+Requires-Dist: pydantic-logfire>=0.0.1
+Requires-Dist: logfire[asyncpg,fastapi,openai]>=3.18.0
+Requires-Dist: opentelemetry-instrumentation-asyncpg>=0.55b1
+Requires-Dist: opentelemetry-instrumentation-fastapi>=0.55b1
+Requires-Dist: asyncpg>=0.30.0
+Requires-Dist: openai>=1.86.0
+Provides-Extra: dev
+Requires-Dist: pytest>=8.4.0; extra == "dev"
+Requires-Dist: httpx>=0.28.1; extra == "dev"
+Requires-Dist: faker>=37.4.0; extra == "dev"
+Requires-Dist: tqdm>=4.67.1; extra == "dev"
+Requires-Dist: pre-commit>=4.2.0; extra == "dev"
+Requires-Dist: openai>=1.86.0; extra == "dev"
+Requires-Dist: pydantic-ai>=0.0.14; extra == "dev"
+
+# Pharmacy Prior Authorization API
+
+FastAPI backend that uses an LLM to answer prior authorization form questions based on patient data.
+
+---
+
+## What Was Implemented
+
+I followed the AI Engineer doc.
+The core deliverable is the `POST /answers` endpoint in `app/main.py`. It accepts a patient record and a set of prior authorization questions, sends them to GPT-4o in a single prompt, and returns structured answers — respecting the `visible_if` conditional logic defined on each question.
+
+### Key pieces:
+
+- **`_format_patient_context`** — serializes the patient model (demographics, prescription, visit notes) into a readable block for the LLM prompt
+- **`_build_prompt`** — constructs a structured prompt listing all questions with their keys and types, instructing the model to return a flat JSON object
+- **`_is_visible` / `_evaluate_condition_part`** — evaluates `visible_if` expressions like `{continuation} = true and {cont_less_6m} = false`, walking through questions in order and building up a resolved answer map as it goes
+- **`get_answers`** — the endpoint: one LLM call, then a post-processing pass to filter out hidden questions, coerce types, and attach `confidence` (0.0–1.0) and `confidence_reason` from the model's response
+
+---
+
+## Design Choices
+
+### Single LLM call + retry for missing keys
+
+All questions are sent in one call. The alternative — one API call per question — would be much slower and more expensive, especially for a form with 30 questions. The tradeoff is that the prompt is larger and the model must hold more context, but GPT-4o handles this well (128K token context window; a full question set + visit notes is ~3,000–4,000 tokens).
+
+If the model omits any keys in its response, a second focused call is made with only the missing questions. This is rare in practice with `gpt-4o` and `response_format: json_object`, but prevents silent wrong answers (where a missing boolean would silently default to `false`).
+
+### All questions sent to the LLM, filtering done after
+
+The prompt includes all questions (even conditionally hidden ones). The LLM answers everything; the `visible_if` filtering happens in Python after. An alternative would be to evaluate `visible_if` first and only send visible questions — but that would require either a two-pass approach or pre-running the conditions without answers, which is circular. Sending everything and filtering after is simpler and correct.
+
+### Sequential `visible_if` evaluation
+
+Questions are walked in order, and the `resolved` dict grows with each answer. This means a condition like `{continuation} = true and {cont_less_6m} = false` is only evaluated after both `continuation` and `cont_less_6m` have been resolved. This matches the natural top-to-bottom flow of a form.
+
+### `temperature=0`
+
+Set to 0 for deterministic output. In a clinical context, getting the same answer every time for the same patient data is important for auditability and consistency — non-zero temperature would introduce variance with no benefit here.
+
+### Boolean coercion
+
+The LLM sometimes returns `"true"` (string) instead of `true` (JSON boolean), even with structured output enabled. A coercion step normalises this: if the question type is `boolean` and the value isn't already a Python `bool`, it checks against `("true", "yes", "1")`. This makes the response robust without relying on the model always returning perfect JSON types.
+
+---
+
+## API Boundaries & Known Limitations
+
+### Token budget
+
+The default model is `gpt-4o`, which has a **128K-token context window**.
+
+| Component | Typical size |
+|---|---|
+| System prompt + instructions | ~300 tokens |
+| Patient demographics + prescription | ~100 tokens |
+| Visit notes (per note) | ~200–800 tokens |
+| Question set (30 questions) | ~600 tokens |
+| **Typical full request** | **~3,000–4,000 tokens** |
+| LLM JSON response | ~1,000–2,000 tokens |
+
+Practical limits before you risk hitting the context window:
+- **Visit notes**: keep total visit note text under ~80,000 tokens (~60,000 words). Extremely long free-text clinical documents (e.g. full discharge summaries copy-pasted verbatim) could overflow this.
+- **Question sets**: up to ~200 questions fit comfortably. Beyond that, the prompt grows large enough that the model may start omitting answers, triggering more retries. The retry mechanism only fires once — if the second call also omits keys, those answers silently fall back to `""` (text) or `false` (boolean).
+
+### Correctness guarantees
+
+The endpoint makes no hard guarantee of correctness — it is an LLM inference, not a rule engine.
+
+- **Confidence scores are self-reported by the model.** The model can be overconfident. A `confidence: 1.0` means the model *claims* the answer is explicitly stated; it does not mean it is always right. Always treat low-confidence answers (`< 0.5`) as requiring human review.
+- **Missing key fallback**: if a question key is absent from both the primary and retry LLM responses, its value defaults to `""` for text questions and `false` for boolean questions — silently, with no error raised.
+- **Boolean coercion**: the model sometimes returns strings like `"true"` or `"yes"` instead of JSON `true`. These are normalised. However, strings like `"no"` or `"0"` are not in the explicit false list — they evaluate to `false` only because they fail the truthy string check, which is correct but not obvious if debugging raw output.
+
+### `visible_if` expression constraints
+
+The parser supports:
+- Single clause: `{key} = value`
+- `and` conjunctions: `{key1} = true and {key2} = false`
+
+It does **not** support:
+- `or` — an expression like `{a} = true or {b} = true` will not be split; the whole string is treated as one malformed clause and silently evaluates to `true` (visible).
+- `!=` or `not` — only `=` comparisons are recognised.
+- Nested parentheses — no grouping is parsed.
+- `or` combined with `and` — precedence is undefined.
+
+### Question ordering requirement
+
+`visible_if` conditions are evaluated as questions are walked **in the order they appear in the request**. A question's dependencies must appear **before** it in the list. If `question B` has `visible_if: "{a} = true"` but `question A` appears after `question B` in the list, `B` will always be hidden because `a` has not yet been resolved when `B` is evaluated.
+
+### Duplicate question keys
+
+No validation is performed on duplicate `key` values within a question set. If two questions share the same key, the second answer will overwrite the first in the `resolved` map, and any `visible_if` conditions referencing that key will see only the second question's answer. The first question's answer will still appear in the response, but its key will be shadowed for visibility evaluation.
+
+### Circular `visible_if` dependencies
+
+A circular dependency (e.g. `A`'s `visible_if` references `B`, and `B`'s `visible_if` references `A`) will cause both questions to be permanently hidden — neither can be resolved first. No cycle detection is performed and no error is raised.
+
+### No request-level rate limiting
+
+The endpoint makes one (or two, on retry) OpenAI API calls per request. There is no built-in rate limiting on the `/answers` endpoint itself. Sending many large concurrent requests may exhaust your OpenAI rate limit quota.
+
+---
+
+## Assumptions
+
+- Visit notes in the sample data are long markdown strings. In a real EHR, this data would come from structured FHIR resources. The prompt treats them as free text, which is fine for this exercise.
+- `visible_if` only uses `=` comparisons and `and` conjunctions — no `or`, no nested parens. The parser handles exactly what the sample data uses.
+- If a question's key is not in the LLM response (e.g. model skipped it), the answer value falls back to `""` for text or `False` for boolean.
+
+---
+
+## Tradeoffs
+
+| Decision | Upside | Downside |
+|---|---|---|
+| Single LLM call + retry for missing keys | Fast; missing keys recovered automatically | Two API calls in the rare case of omissions |
+| Filter after LLM | Simple code | LLM wastes tokens on hidden questions |
+| `temperature=0` | Consistent, auditable | Less flexible if clinical context is ambiguous |
+| Confidence scores from LLM | Reviewers can see uncertain answers flagged | Model self-reported confidence may be overconfident |
+
+**On the two-pass alternative for visible_if filtering:** send only always-visible questions first, evaluate conditions, then send a second call with newly visible ones. Rejected because it adds a mandatory second API call on every request and more complex orchestration code — the current approach of sending everything and filtering after is simpler and correct.
+
+**On temperature=0:** determinism is the right call for clinical prior auth. An insurance reviewer shouldn't get a different result submitting the same form twice. The downside is genuine ambiguity (e.g. "patient has been managing weight" — lifestyle modifications or not?) always resolves the same way rather than surfacing uncertainty. The confidence score is the right tool for flagging that, not temperature.
+
+**On few-shot prompting:** rejected — the model tends to anchor on the examples and reproduce similar values rather than reading the actual patient data independently.
+
+---
+
+## How I Used AI
+
+GitHub Copilot was used throughout — I picked the Claude Sonnet 4.6 model.
+
+A few things I pair programmed with Claude:
+- Understood the business requirements and the prior authorization process
+
+- The workflow was TDD-ish: write tests for the expected behaviour first, then make tests passed.
+
+- Added more tests: a patient not in `patient_data.json`, a new patient starting the medication(Isaiah Reed), and a continuation patient(Jeffrey Donovan)
+
+- With those test cases, built the solution API. It helped with generating the `visible_if` regex parser, prompt engineering
+
+- Wrote a Docker Compose file to spin up the app quickly.
+
+- Handled the case where one LLM call may return missing keys — added a second call for any that are missing.
+
+- Added confidence score and reason so reviewers know how certain each answer is and what it's based on.
+
+
+---
+
+## Running the App
+
+### With Docker Compose (recommended)
+
+```bash
+cp .env.example .env
+# Add your OPENAI_API_KEY to .env
+
+docker compose up --build
+```
+
+The API will be available at `http://localhost:8000`.
+
+### Locally with uv
+
+```bash
+uv sync
+cp .env.example .env
+# Add your OPENAI_API_KEY to .env
+
+uv run uvicorn app.main:app --reload
+```
+
+### Mixing Docker and uv
+
+You can run the server in Docker while using the local `.venv` for tests and tooling — they don't conflict:
+
+| Task | Command |
+|------|---------|
+| Run the server | `docker compose up --build` |
+| Run tests locally | `.venv/bin/python -m pytest` |
+| Lint | `.venv/bin/pre-commit run --all-files` |
+| Run a script | `uv run scripts/generate_patient_data.py` |
+
+Practical takeaway: Use Docker when you want to verify the production-like environment. Use local for day-to-day development since hot reload is faster.
+
+### Running tests
+
+```bash
+# All tests (unit + integration)
+.venv/bin/python -m pytest tests/ -v
+
+# Unit tests only — fast, no API calls
+.venv/bin/python -m pytest -m unit
+
+# Integration tests only — requires OPENAI_API_KEY
+.venv/bin/python -m pytest -m integration
+```
+
+### API docs
+
+FastAPI auto-generates interactive docs at `http://localhost:8000/docs`.
+
+### Example request
+
+```bash
+curl -X POST http://localhost:8000/answers \
+  -H "Content-Type: application/json" \
+  -d @sample_data/example_request_isaiah_reed.json
+```
+
+---
+
+## Environment Variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `OPENAI_API_KEY` | Yes | OpenAI API key |
+| `LLM_MODEL` | No | Model override (default: `gpt-4o`) |
+| `LOGFIRE_TOKEN` | No | Pydantic Logfire observability token |
+
+---
+
+## Project Structure
+
+```
+app/
+  main.py      # FastAPI app, /answers endpoint
+  models.py    # Pydantic models (Patient, Question, Answer)
+  env.py       # Environment setup
+tests/
+  unit/
+    test_visible_if.py        # Fast unit tests for visible_if logic (no API calls)
+  integration/
+    test_answers.py           # Integration tests against the /answers endpoint
+sample_data/
+  patient_data.json                    # Synthetic patient records
+  zepbound_question_set.json           # Full PA question set
+  example_request_isaiah_reed.json     # New patient example request
+  example_response_isaiah_reed.json    # Expected response
+  example_request_jeffrey_donovan.json # Continuation patient example request
+  example_response_jeffrey_donovan.json
+```
